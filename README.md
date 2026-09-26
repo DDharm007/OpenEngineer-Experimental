@@ -178,7 +178,3 @@ Open Engineer
 - **Sandbox Isolation**: All generated code runs inside isolated E2B microVM containers, protecting the host system from untrusted code execution.
 
 ---
-
-## 📄 License
-
-This project is open-source under the [MIT License](LICENSE).
