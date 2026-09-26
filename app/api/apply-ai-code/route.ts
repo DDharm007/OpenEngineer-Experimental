@@ -491,7 +491,7 @@ with open(file_path, 'w') as f:
 print(f"Auto-generated: {file_path}")
           `);
           results.filesCreated.push('src/index.css (with Tailwind)');
-        } catch (error) {
+        } catch {
           results.errors.push('Failed to create index.css with Tailwind');
         }
       }

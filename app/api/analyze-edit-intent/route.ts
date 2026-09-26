@@ -1,25 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createGroq } from '@ai-sdk/groq';
-import { createAnthropic } from '@ai-sdk/anthropic';
-import { createOpenAI } from '@ai-sdk/openai';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { generateObject } from 'ai';
 import { z } from 'zod';
-import type { FileManifest } from '@/types/file-manifest';
-
-const groq = createGroq({
-  apiKey: process.env.GROQ_API_KEY,
-});
-
-const anthropic = createAnthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com/v1',
-});
-
-const openai = createOpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: process.env.OPENAI_BASE_URL,
-});
+import { resolveModel } from '@/lib/model-resolver';
 
 // Schema for the AI's search plan - not file selection!
 const searchPlanSchema = z.object({
@@ -51,7 +33,7 @@ const searchPlanSchema = z.object({
 
 export async function POST(request: NextRequest) {
   try {
-    const { prompt, manifest, model = 'openai/gpt-oss-20b' } = await request.json();
+    const { prompt, manifest, model = 'z-ai/glm-5.2' } = await request.json();
     
     console.log('[analyze-edit-intent] Request received');
     console.log('[analyze-edit-intent] Prompt:', prompt);
@@ -66,7 +48,7 @@ export async function POST(request: NextRequest) {
     
     // Create a summary of available files for the AI
     const validFiles = Object.entries(manifest.files as Record<string, any>)
-      .filter(([path, info]) => {
+      .filter(([path]) => {
         // Filter out invalid paths
         return path.includes('.') && !path.match(/\/\d+$/);
       });
@@ -74,7 +56,6 @@ export async function POST(request: NextRequest) {
     const fileSummary = validFiles
       .map(([path, info]: [string, any]) => {
         const componentName = info.componentInfo?.name || path.split('/').pop();
-        const hasImports = info.imports?.length > 0;
         const childComponents = info.componentInfo?.childComponents?.join(', ') || 'none';
         return `- ${path} (${componentName}, renders: ${childComponents})`;
       })
@@ -93,22 +74,8 @@ export async function POST(request: NextRequest) {
     console.log('[analyze-edit-intent] Analyzing prompt:', prompt);
     console.log('[analyze-edit-intent] File summary preview:', fileSummary.split('\n').slice(0, 5).join('\n'));
     
-    // Select the appropriate AI model based on the request
-    let aiModel;
-    if (model.startsWith('anthropic/')) {
-      aiModel = anthropic(model.replace('anthropic/', ''));
-    } else if (model.startsWith('openai/')) {
-      if (model.includes('gpt-oss')) {
-        aiModel = groq(model);
-      } else {
-        aiModel = openai(model.replace('openai/', ''));
-      }
-    } else if (model.startsWith('google/')) {
-      aiModel = createGoogleGenerativeAI(model.replace('google/', ''));
-    } else {
-      // Default to groq if model format is unclear
-      aiModel = groq(model);
-    }
+    // Resolve model using universal provider resolver
+    const aiModel = resolveModel(model);
     
     console.log('[analyze-edit-intent] Using AI model:', model);
     
@@ -116,65 +83,38 @@ export async function POST(request: NextRequest) {
     const result = await generateObject({
       model: aiModel,
       schema: searchPlanSchema,
-      messages: [
-        {
-          role: 'system',
-          content: `You are an expert at planning code searches. Your job is to create a search strategy to find the exact code that needs to be edited.
+      prompt: `Analyze this user request for a project edit and create a SEARCH PLAN to find the target files.
 
-DO NOT GUESS which files to edit. Instead, provide specific search terms that will locate the code.
+USER REQUEST: "${prompt}"
 
-SEARCH STRATEGY RULES:
-1. For text changes (e.g., "change 'Start Deploying' to 'Go Now'"):
-   - Search for the EXACT text: "Start Deploying"
-   
-2. For style changes (e.g., "make header black"):
-   - Search for component names: "Header", "<header"
-   - Search for class names: "header", "navbar"
-   - Search for className attributes containing relevant words
-   
-3. For removing elements (e.g., "remove the deploy button"):
-   - Search for the button text or aria-label
-   - Search for relevant IDs or data-testids
-   
-4. For navigation/header issues:
-   - Search for: "navigation", "nav", "Header", "navbar"
-   - Look for Link components or href attributes
-   
-5. Be SPECIFIC:
-   - Use exact capitalization for user-visible text
-   - Include multiple search terms for redundancy
-   - Add regex patterns for structural searches
+AVAILABLE PROJECT FILES:
+${fileSummary}
 
-Current project structure for context:
-${fileSummary}`
-        },
-        {
-          role: 'user',
-          content: `User request: "${prompt}"
+SEARCH PLAN GUIDELINES:
+1. Identify WHAT element/component the user wants to change
+2. Formulate SPECIFIC search terms to find that element in code:
+   - Exact text mentioned (e.g., "Get Started", "Hero Title")
+   - Likely class names (e.g., "hero", "header", "nav", "footer")
+   - Component names (e.g., "Header", "ProductCard")
+3. Keep search terms simple and exact - we use string matching!
 
-Create a search plan to find the exact code that needs to be modified. Include specific search terms and patterns.`
-        }
-      ]
+Return a JSON search plan object according to the schema.`
     });
     
-    console.log('[analyze-edit-intent] Search plan created:', {
-      editType: result.object.editType,
-      searchTerms: result.object.searchTerms,
-      patterns: result.object.regexPatterns?.length || 0,
-      reasoning: result.object.reasoning
-    });
+    console.log('[analyze-edit-intent] Search plan generated successfully');
+    console.log('[analyze-edit-intent] Search plan editType:', result.object.editType);
+    console.log('[analyze-edit-intent] Search terms:', result.object.searchTerms);
     
-    // Return the search plan, not file matches
     return NextResponse.json({
       success: true,
-      searchPlan: result.object
+      plan: result.object
     });
     
   } catch (error) {
     console.error('[analyze-edit-intent] Error:', error);
     return NextResponse.json({
       success: false,
-      error: (error as Error).message
+      error: error instanceof Error ? error.message : 'Unknown error during edit intent analysis'
     }, { status: 500 });
   }
 }

@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createGroq } from '@ai-sdk/groq';
-import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { streamText } from 'ai';
 import type { SandboxState } from '@/types/sandbox';
 import { selectFilesForEdit, getFileContents, formatFilesForAI } from '@/lib/context-selector';
@@ -10,23 +7,14 @@ import { executeSearchPlan, formatSearchResultsForAI, selectTargetFile } from '@
 import { FileManifest } from '@/types/file-manifest';
 import type { ConversationState, ConversationMessage, ConversationEdit } from '@/types/conversation';
 import { appConfig } from '@/config/app.config';
+import { resolveModel } from '@/lib/model-resolver';
 
-const groq = createGroq({
-  apiKey: process.env.GROQ_API_KEY,
+// Fallback NVIDIA NIM — OpenAI-compatible endpoint
+const nvidia = createOpenAI({
+  apiKey: process.env.NVIDIA_API_KEY ?? '',
+  baseURL: 'https://integrate.api.nvidia.com/v1',
 });
 
-const anthropic = createAnthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com/v1',
-});
-
-const googleGenerativeAI = createGoogleGenerativeAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
-
-const openai = createOpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
 
 // Helper function to analyze user preferences from conversation history
 function analyzeUserPreferences(messages: ConversationMessage[]): {
@@ -74,10 +62,11 @@ declare global {
 
 export async function POST(request: NextRequest) {
   try {
-    const { prompt, model = 'openai/gpt-oss-20b', context, isEdit = false } = await request.json();
+    const { prompt, model = 'openai/gpt-oss-20b', context, isEdit = false, stage = 'frontend' } = await request.json();
     
     console.log('[generate-ai-code-stream] Received request:');
     console.log('[generate-ai-code-stream] - prompt:', prompt);
+    console.log('[generate-ai-code-stream] - stage:', stage);
     console.log('[generate-ai-code-stream] - isEdit:', isEdit);
     console.log('[generate-ai-code-stream] - context.sandboxId:', context?.sandboxId);
     console.log('[generate-ai-code-stream] - context.currentFiles:', context?.currentFiles ? Object.keys(context.currentFiles) : 'none');
@@ -151,8 +140,44 @@ export async function POST(request: NextRequest) {
     // Start processing in background
     (async () => {
       try {
-        // Send initial status
-        await sendProgress({ type: 'status', message: 'Initializing AI...' });
+        // Send initial status with stage info
+        await sendProgress({ type: 'status', message: stage === 'backend' ? '🔧 Starting backend generation...' : '🎨 Analyzing your request...' });
+        
+        // ============ PROMPT ANALYSIS PHASE ============
+        let enrichedPrompt = prompt;
+        let appType = 'general';
+        
+        if (!isEdit && stage === 'frontend') {
+          // Detect app type from prompt keywords
+          const lower = prompt.toLowerCase();
+          if (lower.match(/e-?commerce|shop|store|product|cart|checkout/)) appType = 'ecommerce';
+          else if (lower.match(/dashboard|admin|analytics|chart|graph/)) appType = 'dashboard';
+          else if (lower.match(/portfolio|resume|cv|personal/)) appType = 'portfolio';
+          else if (lower.match(/blog|article|post|writing/)) appType = 'blog';
+          else if (lower.match(/landing|saas|startup|marketing/)) appType = 'landing';
+          else if (lower.match(/task|todo|project|manage|kanban/)) appType = 'taskmanager';
+          else if (lower.match(/restaurant|food|menu|order/)) appType = 'restaurant';
+          else if (lower.match(/social|chat|messaging|community/)) appType = 'social';
+          
+          // Enrich vague prompts with specific requirements
+          if (prompt.split(' ').length < 10) {
+            const enrichments: Record<string, string> = {
+              ecommerce: 'with product grid, product detail modal, shopping cart sidebar, and checkout form. Include hero banner, featured products, and footer.',
+              dashboard: 'with sidebar navigation, stat cards, data table, and chart section. Include dark theme, responsive layout.',
+              portfolio: 'with hero section, about me, projects showcase grid, skills section, and contact form. Modern dark theme.',
+              blog: 'with article list, article detail view, sidebar with categories, and responsive layout.',
+              landing: 'with hero section, features grid, testimonials, pricing cards, CTA section, and footer.',
+              taskmanager: 'with task list, add task form, status toggle, priority badges, and filter options.',
+              restaurant: 'with hero banner, menu sections with food cards, reservation form, and footer with location.',
+              social: 'with post feed, create post form, user profile card, and sidebar navigation.',
+              general: 'with hero section, features section, about section, and footer. Modern responsive design.'
+            };
+            enrichedPrompt = `${prompt} ${enrichments[appType] || enrichments.general}`;
+            console.log(`[generate-ai-code-stream] Enriched prompt (${appType}): ${enrichedPrompt}`);
+          }
+          
+          await sendProgress({ type: 'status', message: `Detected ${appType} app — planning architecture...` });
+        }
         
         // No keep-alive needed - sandbox provisioned for 10 minutes
         
@@ -170,7 +195,7 @@ export async function POST(request: NextRequest) {
           if (manifest) {
             await sendProgress({ type: 'status', message: '🔍 Creating search plan...' });
             
-            const fileContents = global.sandboxState.fileCache.files;
+            const fileContents = global.sandboxState?.fileCache?.files || {};
             console.log('[generate-ai-code-stream] Files available for search:', Object.keys(fileContents).length);
             
             // STEP 1: Get search plan from AI
@@ -331,7 +356,7 @@ User request: "${prompt}"`;
                         
                         // For now, fall back to keyword search since we don't have file contents for search execution
                         // This path happens when no manifest was initially available
-                        let targetFiles = [];
+                        let targetFiles: string[] = [];
                         if (!searchPlan || searchPlan.searchTerms.length === 0) {
                           console.warn('[generate-ai-code-stream] No target files after fetch, searching for relevant files');
                           
@@ -550,352 +575,65 @@ Remember: You are a SURGEON making a precise incision, not an artist repainting 
           }
         }
         
-        // Build system prompt with conversation awareness
-        const systemPrompt = `You are an expert React developer with perfect memory of the conversation. You maintain context across messages and remember scraped websites, generated components, and applied code. Generate clean, modern React code for Vite applications.
+        // ============ ULTRA-COMPRESSED SYSTEM PROMPT ============
+        const systemPrompt = `You are a senior React developer. Generate production-quality code for Vite + Tailwind CSS.
 ${conversationContext}
 
-🚨 CRITICAL RULES - YOUR MOST IMPORTANT INSTRUCTIONS:
-1. **DO EXACTLY WHAT IS ASKED - NOTHING MORE, NOTHING LESS**
-   - Don't add features not requested
-   - Don't fix unrelated issues
-   - Don't improve things not mentioned
-2. **CHECK App.jsx FIRST** - ALWAYS see what components exist before creating new ones
-3. **NAVIGATION LIVES IN Header.jsx** - Don't create Nav.jsx if Header exists with nav
-4. **USE STANDARD TAILWIND CLASSES ONLY**:
-   - ✅ CORRECT: bg-white, text-black, bg-blue-500, bg-gray-100, text-gray-900
-   - ❌ WRONG: bg-background, text-foreground, bg-primary, bg-muted, text-secondary
-   - Use ONLY classes from the official Tailwind CSS documentation
-5. **FILE COUNT LIMITS**:
-   - Simple style/text change = 1 file ONLY
-   - New component = 2 files MAX (component + parent)
-   - If >3 files, YOU'RE DOING TOO MUCH
-
-COMPONENT RELATIONSHIPS (CHECK THESE FIRST):
-- Navigation usually lives INSIDE Header.jsx, not separate Nav.jsx
-- Logo is typically in Header, not standalone
-- Footer often contains nav links already
-- Menu/Hamburger is part of Header, not separate
-
-PACKAGE USAGE RULES:
-- DO NOT use react-router-dom unless user explicitly asks for routing
-- For simple nav links in a single-page app, use scroll-to-section or href="#"
-- Only add routing if building a multi-page application
-- Common packages are auto-installed from your imports
-
-WEBSITE CLONING REQUIREMENTS:
-When recreating/cloning a website, you MUST include:
-1. **Header with Navigation** - Usually Header.jsx containing nav
-2. **Hero Section** - The main landing area (Hero.jsx)
-3. **Main Content Sections** - Features, Services, About, etc.
-4. **Footer** - Contact info, links, copyright (Footer.jsx)
-5. **App.jsx** - Main app component that imports and uses all components
-
-${isEdit ? `CRITICAL: THIS IS AN EDIT TO AN EXISTING APPLICATION
-
-YOU MUST FOLLOW THESE EDIT RULES:
-0. NEVER create tailwind.config.js, vite.config.js, package.json, or any other config files - they already exist!
-1. DO NOT regenerate the entire application
-2. DO NOT create files that already exist (like App.jsx, index.css, tailwind.config.js)
-3. ONLY edit the EXACT files needed for the requested change - NO MORE, NO LESS
-4. If the user says "update the header", ONLY edit the Header component - DO NOT touch Footer, Hero, or any other components
-5. If the user says "change the color", ONLY edit the relevant style or component file - DO NOT "improve" other parts
-6. If you're unsure which file to edit, choose the SINGLE most specific one related to the request
-7. IMPORTANT: When adding new components or libraries:
-   - Create the new component file
-   - UPDATE ONLY the parent component that will use it
-   - Example: Adding a Newsletter component means:
-     * Create Newsletter.jsx
-     * Update ONLY the file that will use it (e.g., Footer.jsx OR App.jsx) - NOT both
-8. When adding npm packages:
-   - Import them ONLY in the files where they're actually used
-   - The system will auto-install missing packages
-
-CRITICAL FILE MODIFICATION RULES - VIOLATION = FAILURE:
-- **NEVER TRUNCATE FILES** - Always return COMPLETE files with ALL content
-- **NO ELLIPSIS (...)** - Include every single line of code, no skipping
-- Files MUST be complete and runnable - include ALL imports, functions, JSX, and closing tags
-- Count the files you're about to generate
-- If the user asked to change ONE thing, you should generate ONE file (or at most two if adding a new component)
-- DO NOT "fix" or "improve" files that weren't mentioned in the request
-- DO NOT update multiple components when only one was requested
-- DO NOT add features the user didn't ask for
-- RESIST the urge to be "helpful" by updating related files
-
-CRITICAL: DO NOT REDESIGN OR REIMAGINE COMPONENTS
-- "update" means make a small change, NOT redesign the entire component
-- "change X to Y" means ONLY change X to Y, nothing else
-- "fix" means repair what's broken, NOT rewrite everything
-- "remove X" means delete X from the existing file, NOT create a new file
-- "delete X" means remove X from where it currently exists
-- Preserve ALL existing functionality and design unless explicitly asked to change it
-
-NEVER CREATE NEW FILES WHEN THE USER ASKS TO REMOVE/DELETE SOMETHING
-If the user says "remove X", you must:
-1. Find which existing file contains X
-2. Edit that file to remove X
-3. DO NOT create any new files
-
-${editContext ? `
-TARGETED EDIT MODE ACTIVE
-- Edit Type: ${editContext.editIntent.type}
-- Confidence: ${editContext.editIntent.confidence}
-- Files to Edit: ${editContext.primaryFiles.join(', ')}
-
-🚨 CRITICAL RULE - VIOLATION WILL RESULT IN FAILURE 🚨
-YOU MUST ***ONLY*** GENERATE THE FILES LISTED ABOVE!
-
-ABSOLUTE REQUIREMENTS:
-1. COUNT the files in "Files to Edit" - that's EXACTLY how many files you must generate
-2. If "Files to Edit" shows ONE file, generate ONLY that ONE file
-3. DO NOT generate App.jsx unless it's EXPLICITLY listed in "Files to Edit"
-4. DO NOT generate ANY components that aren't listed in "Files to Edit"
-5. DO NOT "helpfully" update related files
-6. DO NOT fix unrelated issues you notice
-7. DO NOT improve code quality in files not being edited
-8. DO NOT add bonus features
-
-EXAMPLE VIOLATIONS (THESE ARE FAILURES):
-❌ User says "update the hero" → You update Hero, Header, Footer, and App.jsx
-❌ User says "change header color" → You redesign the entire header
-❌ User says "fix the button" → You update multiple components
-❌ Files to Edit shows "Hero.jsx" → You also generate App.jsx "to integrate it"
-❌ Files to Edit shows "Header.jsx" → You also update Footer.jsx "for consistency"
-
-CORRECT BEHAVIOR (THIS IS SUCCESS):
-✅ User says "update the hero" → You ONLY edit Hero.jsx with the requested change
-✅ User says "change header color" → You ONLY change the color in Header.jsx
-✅ User says "fix the button" → You ONLY fix the specific button issue
-✅ Files to Edit shows "Hero.jsx" → You generate ONLY Hero.jsx
-✅ Files to Edit shows "Header.jsx, Nav.jsx" → You generate EXACTLY 2 files: Header.jsx and Nav.jsx
-
-THE AI INTENT ANALYZER HAS ALREADY DETERMINED THE FILES.
-DO NOT SECOND-GUESS IT.
-DO NOT ADD MORE FILES.
-ONLY OUTPUT THE EXACT FILES LISTED IN "Files to Edit".
-` : ''}
-
-VIOLATION OF THESE RULES WILL RESULT IN FAILURE!
-` : ''}
-
-CRITICAL INCREMENTAL UPDATE RULES:
-- When the user asks for additions or modifications (like "add a videos page", "create a new component", "update the header"):
-  - DO NOT regenerate the entire application
-  - DO NOT recreate files that already exist unless explicitly asked
-  - ONLY create/modify the specific files needed for the requested change
-  - Preserve all existing functionality and files
-  - If adding a new page/route, integrate it with the existing routing system
-  - Reference existing components and styles rather than duplicating them
-  - NEVER recreate config files (tailwind.config.js, vite.config.js, package.json, etc.)
-
-IMPORTANT: When the user asks for edits or modifications:
-- You have access to the current file contents in the context
-- Make targeted changes to existing files rather than regenerating everything
-- Preserve the existing structure and only modify what's requested
-- If you need to see a specific file that's not in context, mention it
-
-IMPORTANT: You have access to the full conversation context including:
-- Previously scraped websites and their content
-- Components already generated and applied
-- The current project being worked on
-- Recent conversation history
-- Any Vite errors that need to be resolved
-
-When the user references "the app", "the website", or "the site" without specifics, refer to:
-1. The most recently scraped website in the context
-2. The current project name in the context
-3. The files currently in the sandbox
-
-If you see scraped websites in the context, you're working on a clone/recreation of that site.
-
-CRITICAL UI/UX RULES:
-- NEVER use emojis in any code, text, console logs, or UI elements
-- ALWAYS ensure responsive design using proper Tailwind classes (sm:, md:, lg:, xl:)
-- ALWAYS use proper mobile-first responsive design patterns
-- NEVER hardcode pixel widths - use relative units and responsive classes
-- ALWAYS test that the layout works on mobile devices (320px and up)
-- ALWAYS make sections full-width by default - avoid max-w-7xl or similar constraints
-- For full-width layouts: use className="w-full" or no width constraint at all
-- Only add max-width constraints when explicitly needed for readability (like blog posts)
-- Prefer system fonts and clean typography
-- Ensure all interactive elements have proper hover/focus states
-- Use proper semantic HTML elements for accessibility
-
-CRITICAL STYLING RULES - MUST FOLLOW:
-- NEVER use inline styles with style={{ }} in JSX
-- NEVER use <style jsx> tags or any CSS-in-JS solutions
-- NEVER create App.css, Component.css, or any component-specific CSS files
-- NEVER import './App.css' or any CSS files except index.css
-- ALWAYS use Tailwind CSS classes for ALL styling
-- ONLY create src/index.css with the @tailwind directives
-- The ONLY CSS file should be src/index.css with:
-  @tailwind base;
-  @tailwind components;
-  @tailwind utilities;
-- Use Tailwind's full utility set: spacing, colors, typography, flexbox, grid, animations, etc.
-- ALWAYS add smooth transitions and animations where appropriate:
-  - Use transition-all, transition-colors, transition-opacity for hover states
-  - Use animate-fade-in, animate-pulse, animate-bounce for engaging UI elements
-  - Add hover:scale-105 or hover:scale-110 for interactive elements
-  - Use transform and transition utilities for smooth interactions
-- For complex layouts, combine Tailwind utilities rather than writing custom CSS
-- NEVER use non-standard Tailwind classes like "border-border", "bg-background", "text-foreground", etc.
-- Use standard Tailwind classes only:
-  - For borders: use "border-gray-200", "border-gray-300", etc. NOT "border-border"
-  - For backgrounds: use "bg-white", "bg-gray-100", etc. NOT "bg-background"
-  - For text: use "text-gray-900", "text-black", etc. NOT "text-foreground"
-- Examples of good Tailwind usage:
-  - Buttons: className="px-4 py-2 bg-blue-600 text-white rounded-lg shadow-md hover:bg-blue-700 hover:shadow-lg transform hover:scale-105 transition-all duration-200"
-  - Cards: className="bg-white rounded-lg shadow-md p-6 border border-gray-200 hover:shadow-xl transition-shadow duration-300"
-  - Full-width sections: className="w-full px-4 sm:px-6 lg:px-8"
-  - Constrained content (only when needed): className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8"
-  - Dark backgrounds: className="min-h-screen bg-gray-900 text-white"
-  - Hero sections: className="animate-fade-in-up"
-  - Feature cards: className="transform hover:scale-105 transition-transform duration-300"
-  - CTAs: className="animate-pulse hover:animate-none"
-
-CRITICAL STRING AND SYNTAX RULES:
-- ALWAYS escape apostrophes in strings: use \' instead of ' or use double quotes
-- ALWAYS escape quotes properly in JSX attributes
-- NEVER use curly quotes or smart quotes ('' "" '' "") - only straight quotes (' ")
-- ALWAYS convert smart/curly quotes to straight quotes:
-  - ' and ' → '
-  - " and " → "
-  - Any other Unicode quotes → straight quotes
-- When strings contain apostrophes, either:
-  1. Use double quotes: "you're" instead of 'you're'
-  2. Escape the apostrophe: 'you\'re'
-- When working with scraped content, ALWAYS sanitize quotes first
-- Replace all smart quotes with straight quotes before using in code
-- Be extra careful with user-generated content or scraped text
-- Always validate that JSX syntax is correct before generating
-
-CRITICAL CODE SNIPPET DISPLAY RULES:
-- When displaying code examples in JSX, NEVER put raw curly braces { } in text
-- ALWAYS wrap code snippets in template literals with backticks
-- For code examples in components, use one of these patterns:
-  1. Template literals: <div>{\`const example = { key: 'value' }\`}</div>
-  2. Pre/code blocks: <pre><code>{\`your code here\`}</code></pre>
-  3. Escape braces: <div>{'{'}key: value{'}'}</div>
-- NEVER do this: <div>const example = { key: 'value' }</div> (causes parse errors)
-- For multi-line code snippets, always use:
-  <pre className="bg-gray-900 text-gray-100 p-4 rounded">
-    <code>{\`
-      // Your code here
-      const example = {
-        key: 'value'
-      }
-    \`}</code>
-  </pre>
-
-CRITICAL: When asked to create a React app or components:
-- ALWAYS CREATE ALL FILES IN FULL - never provide partial implementations
-- ALWAYS CREATE EVERY COMPONENT that you import - no placeholders
-- ALWAYS IMPLEMENT COMPLETE FUNCTIONALITY - don't leave TODOs unless explicitly asked
-- If you're recreating a website, implement ALL sections and features completely
-- NEVER create tailwind.config.js - it's already configured in the template
-- ALWAYS include a Navigation/Header component (Nav.jsx or Header.jsx) - websites need navigation!
-
-REQUIRED COMPONENTS for website clones:
-1. Nav.jsx or Header.jsx - Navigation bar with links (NEVER SKIP THIS!)
-2. Hero.jsx - Main landing section
-3. Features/Services/Products sections - Based on the site content
-4. Footer.jsx - Footer with links and info
-5. App.jsx - Main component that imports and arranges all components
-- NEVER create vite.config.js - it's already configured in the template
-- NEVER create package.json - it's already configured in the template
-
-WHEN WORKING WITH SCRAPED CONTENT:
-- ALWAYS sanitize all text content before using in code
-- Convert ALL smart quotes to straight quotes
-- Example transformations:
-  - "Firecrawl's API" → "Firecrawl's API" or "Firecrawl\\'s API"
-  - 'It's amazing' → "It's amazing" or 'It\\'s amazing'
-  - "Best tool ever" → "Best tool ever"
-- When in doubt, use double quotes for strings containing apostrophes
-- For testimonials or quotes from scraped content, ALWAYS clean the text:
-  - Bad: content: 'Moved our internal agent's web scraping...'
-  - Good: content: "Moved our internal agent's web scraping..."
-  - Also good: content: 'Moved our internal agent\\'s web scraping...'
-
-When generating code, FOLLOW THIS PROCESS:
-1. ALWAYS generate src/index.css FIRST - this establishes the styling foundation
-2. List ALL components you plan to import in App.jsx
-3. Count them - if there are 10 imports, you MUST create 10 component files
-4. Generate src/index.css first (with proper CSS reset and base styles)
-5. Generate App.jsx second
-6. Then generate EVERY SINGLE component file you imported
-7. Do NOT stop until all imports are satisfied
-
-Use this XML format for React components only (DO NOT create tailwind.config.js - it already exists):
-
+OUTPUT FORMAT:
 <file path="src/index.css">
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 </file>
-
 <file path="src/App.jsx">
-// Main App component that imports and uses other components
-// Use Tailwind classes: className="min-h-screen bg-gray-50"
+// complete code here
 </file>
-
 <file path="src/components/Example.jsx">
-// Your React component code here
-// Use Tailwind classes for ALL styling
+// complete code here
 </file>
 
-CRITICAL COMPLETION RULES:
-1. NEVER say "I'll continue with the remaining components"
-2. NEVER say "Would you like me to proceed?"
-3. NEVER use <continue> tags
-4. Generate ALL components in ONE response
-5. If App.jsx imports 10 components, generate ALL 10
-6. Complete EVERYTHING before ending your response
+When finished: <explanation>summary</explanation>
 
-With 16,000 tokens available, you have plenty of space to generate a complete application. Use it!
-
-UNDERSTANDING USER INTENT FOR INCREMENTAL VS FULL GENERATION:
-- "add/create/make a [specific feature]" → Add ONLY that feature to existing app
-- "add a videos page" → Create ONLY Videos.jsx and update routing
-- "update the header" → Modify ONLY header component
-- "fix the styling" → Update ONLY the affected components
-- "change X to Y" → Find the file containing X and modify it
-- "make the header black" → Find Header component and change its color
-- "rebuild/recreate/start over" → Full regeneration
-- Default to incremental updates when working on an existing app
-
-SURGICAL EDIT RULES (CRITICAL FOR PERFORMANCE):
-- **PREFER TARGETED CHANGES**: Don't regenerate entire components for small edits
-- For color/style changes: Edit ONLY the specific className or style prop
-- For text changes: Change ONLY the text content, keep everything else
-- For adding elements: INSERT into existing JSX, don't rewrite the whole return
-- **PRESERVE EXISTING CODE**: Keep all imports, functions, and unrelated code exactly as-is
-- Maximum files to edit:
-  - Style change = 1 file ONLY
-  - Text change = 1 file ONLY
-  - New feature = 2 files MAX (feature + parent)
-- If you're editing >3 files for a simple request, STOP - you're doing too much
-
-EXAMPLES OF CORRECT SURGICAL EDITS:
-✅ "change header to black" → Find className="..." in Header.jsx, change ONLY color classes
-✅ "update hero text" → Find the <h1> or <p> in Hero.jsx, change ONLY the text inside
-✅ "add a button to hero" → Find the return statement, ADD button, keep everything else
-❌ WRONG: Regenerating entire Header.jsx to change one color
-❌ WRONG: Rewriting Hero.jsx to add one button
-
-NAVIGATION/HEADER INTELLIGENCE:
-- ALWAYS check App.jsx imports first
-- Navigation is usually INSIDE Header.jsx, not separate
-- If user says "nav", check Header.jsx FIRST
-- Only create Nav.jsx if no navigation exists anywhere
-- Logo, menu, hamburger = all typically in Header
-
-CRITICAL: When files are provided in the context:
-1. The user is asking you to MODIFY the existing app, not create a new one
-2. Find the relevant file(s) from the provided context
-3. Generate ONLY the files that need changes
-4. Do NOT ask to see files - they are already provided in the context above
-5. Make the requested change immediately`;
+CRITICAL RULES (violation = broken app):
+1. EVERY file you import MUST exist in YOUR output. If you write "import X from './Y'", you MUST generate file Y.
+2. NEVER create Context files (AuthContext, ThemeContext, etc.) — put state in App.jsx or the component.
+3. NEVER create custom hooks files — put useState/useEffect directly in the component.
+4. NEVER create separate service/API/utils files for simple apps — inline the logic.
+5. Each component = one self-contained file with its own imports, logic, and JSX.
+6. Use ONLY standard Tailwind classes. NEVER use custom classes like bg-primary, text-foreground.
+7. NEVER use inline styles (style={{}}). NEVER import component CSS files.
+8. src/index.css MUST only contain @tailwind directives and optional @keyframes.
+9. NEVER truncate code with "..." or comments like "// rest of code". Write EVERY line.
+10. If you're running low on tokens, STOP after the last COMPLETE file. Never output a half-written file.
+11. File order: index.css → App.jsx → components (in dependency order).
+12. NEVER create config files (tailwind.config, vite.config, package.json) — they already exist.
+13. Aim for 5-8 COMPLETE files. Fewer complete files > many broken files.
+14. ALWAYS use \`export default ComponentName\` at the end of EVERY component file. ALWAYS import with default syntax: \`import ComponentName from './path'\`. NEVER use named exports \`export { Name }\` or named imports \`import { Name } from\`. This is the #1 cause of broken apps.
+15. NEVER import icon libraries (react-icons, lucide-react, heroicons, @heroicons). Use Unicode emoji (\ud83d\udcca \u2699\ufe0f \u270f\ufe0f \ud83d\uddd1\ufe0f \u2795 \ud83d\udcbe \ud83d\udcdd \ud83d\udd0d) or Tailwind-styled spans instead. Icon library imports cause crashes because AI hallucinates non-existent icon names.
+${stage === 'frontend' ? `
+FRONTEND-ONLY STAGE:
+- This is the FRONTEND stage. NEVER generate firebase files, service files, API files, database files, auth files, or any backend code.
+- Use HARDCODED/MOCK data arrays directly inside components. Example: const products = [{id:1, name:'Product', price:29.99}]
+- NEVER import from './lib/firebase', './services/', './api/', './utils/api' — these do NOT exist yet.
+- If the app needs data, hardcode realistic sample data inside the component.
+` : ''}${stage === 'backend' ? `
+BACKEND STAGE:
+- This is the BACKEND stage. Generate ONLY backend integration files (firebase config, services, API utils).
+- Also output UPDATED versions of frontend files that need to use real data instead of mock data.
+- The frontend already exists and works with mock data. Your job is to add real data persistence.
+- Always generate src/lib/firebase.js with config, and src/services/ files with CRUD operations.
+` : ''}${isEdit ? `
+EDIT MODE — Surgical precision:
+- ONLY modify files directly related to the request
+- NEVER regenerate the entire app
+- Maximum files: style change = 1 file, new feature = 2-3 files max
+${editContext ? `
+TARGETED FILES: ${editContext.primaryFiles.join(', ')}
+Edit Type: ${editContext.editIntent.type}
+ONLY output the files listed above.
+` : ''}
+` : ''}
+`;
 
         // Build full prompt with context
         let fullPrompt = prompt;
@@ -952,16 +690,17 @@ CRITICAL: When files are provided in the context:
                     };
                   }
                   
-                  // Store files in cache
                   for (const [path, content] of Object.entries(filesData.files)) {
                     const normalizedPath = path.replace('/home/user/app/', '');
-                    global.sandboxState.fileCache.files[normalizedPath] = {
-                      content: content as string,
-                      lastModified: Date.now()
-                    };
+                    if (global.sandboxState.fileCache) {
+                      global.sandboxState.fileCache.files[normalizedPath] = {
+                        content: content as string,
+                        lastModified: Date.now()
+                      };
+                    }
                   }
                   
-                  if (filesData.manifest) {
+                  if (filesData.manifest && global.sandboxState.fileCache) {
                     global.sandboxState.fileCache.manifest = filesData.manifest;
                     
                     // Now try to analyze edit intent with the fetched manifest
@@ -993,7 +732,7 @@ CRITICAL: When files are provided in the context:
                   }
                   
                   // Update variables
-                  backendFiles = global.sandboxState.fileCache.files;
+                  backendFiles = global.sandboxState.fileCache?.files || {};
                   hasBackendFiles = Object.keys(backendFiles).length > 0;
                   console.log('[generate-ai-code-stream] Updated backend cache with fetched files');
                 }
@@ -1144,21 +883,179 @@ CRITICAL: When files are provided in the context:
           }
         }
         
-        await sendProgress({ type: 'status', message: 'Planning application structure...' });
-        
-        console.log('\n[generate-ai-code-stream] Starting streaming response...\n');
-        
         // Track packages that need to be installed
         const packagesToInstall: string[] = [];
         
         // Determine which provider to use based on model
-        const isAnthropic = model.startsWith('anthropic/');
-        const isGoogle = model.startsWith('google/');
-        const isOpenAI = model.startsWith('openai/gpt-5');
-        const modelProvider = isAnthropic ? anthropic : (isOpenAI ? openai : (isGoogle ? googleGenerativeAI : groq));
-        const actualModel = isAnthropic ? model.replace('anthropic/', '') : 
-                           (model === 'openai/gpt-5') ? 'gpt-5' :
-                           (isGoogle ? model.replace('google/', '') : model);
+        // Universal resolver supports OpenRouter, Claude, OpenAI, Gemini, DeepSeek, Groq, xAI, NVIDIA NIM, Moonshot, ZAI
+        const resolvedLanguageModel = resolveModel(model);
+        const modelProvider = (_m?: string) => resolvedLanguageModel;
+        const actualModel = model;
+        const isAnthropic = model.includes('claude');
+        const isOpenAI = model.includes('gpt-') || model.includes('o1') || model.includes('o3');
+
+
+        // ============ PHASE A: BLUEPRINT PLANNING ============
+        let blueprint: any = null;
+        
+        if (!isEdit) {
+          await sendProgress({ type: 'status', message: stage === 'backend' ? 'Planning backend architecture...' : 'Designing application architecture...' });
+          await sendProgress({
+            type: 'thinking',
+            text: `Analyzing requirements: "${prompt}"\n\nInferring user intent and design specifications...\nI'll shape this into a polished, modern application with clean components, responsive layout, and fluid interactions.\n`
+          });
+          console.log(`[generate-ai-code-stream] Phase A: Generating blueprint (stage: ${stage})...`);
+          
+          try {
+            const blueprintResult = await streamText({
+              model: modelProvider(actualModel),
+              messages: [
+                {
+                  role: 'system',
+                  content: stage === 'backend' 
+                    ? `You are a software architect. Given the user's request and their existing frontend files, output a JSON blueprint for backend integration files.
+
+RESPOND WITH ONLY VALID JSON — no markdown, no explanation, no code fences.
+
+JSON structure:
+{
+  "appName": "App Name",
+  "files": [
+    {
+      "path": "src/lib/firebase.js",
+      "purpose": "Firebase configuration and initialization",
+      "estimatedLines": 25,
+      "exports": ["db", "auth"]
+    },
+    {
+      "path": "src/services/api.js",
+      "purpose": "CRUD operations for the data model",
+      "estimatedLines": 60,
+      "exports": ["getItems", "addItem", "updateItem", "deleteItem"]
+    }
+  ],
+  "packages": ["firebase"],
+  "updatedFrontendFiles": ["src/App.jsx"],
+  "dataModel": "Description of data collections and fields"
+}
+
+BACKEND RULES:
+- Maximum 3-5 backend files
+- Always include firebase.js config
+- Create service files that match the frontend's data needs
+- List which frontend files need updating to use real data
+- Only plan files that add real data/auth functionality`
+                    : `You are a software architect. Given a user request, output a JSON blueprint for the FRONTEND of a React + Vite + Tailwind CSS application.
+
+RESPOND WITH ONLY VALID JSON — no markdown, no explanation, no code fences.
+
+JSON structure:
+{
+  "appName": "App Name",
+  "appType": "${appType}",
+  "layout": "single-page" or "multi-page",
+  "colorPalette": { "bg": "#0f172a", "surface": "#1e293b", "primary": "#6366f1", "accent": "#f59e0b", "text": "#f8fafc" },
+  "files": [
+    {
+      "path": "src/index.css",
+      "purpose": "Tailwind directives and custom keyframes only",
+      "estimatedLines": 10
+    },
+    {
+      "path": "src/App.jsx",
+      "purpose": "Root component with routing and global state",
+      "estimatedLines": 50,
+      "state": ["darkMode", "activeSection"],
+      "imports": ["Header", "Hero", "Footer"],
+      "exports": ["App"]
+    },
+    {
+      "path": "src/components/Header.jsx",
+      "purpose": "Navigation bar with logo and links",
+      "estimatedLines": 45,
+      "props": ["darkMode", "toggleDarkMode"],
+      "renders": "nav with logo, navigation links, dark mode toggle button",
+      "exports": ["Header"]
+    }
+  ],
+  "packages": [],
+  "dataFlow": "App manages state, passes to children as props",
+  "theme": "Dark modern with indigo accents and glass effects",
+  "keyFeatures": ["responsive nav", "hero with CTA", "feature cards"],
+  "needsBackend": true or false
+}
+
+FRONTEND BLUEPRINT RULES:
+- This is FRONTEND ONLY — NO firebase, NO API files, NO service files, NO database files
+- MAXIMUM 6-8 files for simple apps, 8-10 for complex apps
+- NEVER plan Context files, custom hook files, service files, or API files
+- ALL state lives in App.jsx — passed down as props
+- Use MOCK/HARDCODED data for now (backend will be added later if user wants)
+- "renders" field: describe the actual HTML elements (nav, section, div grid, form, etc.)
+- "props" field: list exact prop names the component receives
+- "state" field: list useState variable names
+- colorPalette: pick specific, beautiful hex colors
+- "needsBackend": set to true if the app would benefit from a database (e-commerce, task manager, etc.)
+- Each file MUST be independent and self-contained when given its props
+- Order: index.css → App.jsx → components in dependency order`
+                },
+                {
+                  role: 'user',
+                  content: stage === 'backend'
+                    ? `Create a backend blueprint for: ${enrichedPrompt}\n\nExisting frontend files: ${context?.conversationContext?.appliedCode?.map((f: any) => f.path || f).join(', ') || 'standard React app'}`
+                    : `Create a frontend blueprint for: ${enrichedPrompt}`
+                }
+              ],
+              temperature: appConfig.ai.blueprintTemperature,
+              maxTokens: appConfig.ai.blueprintMaxTokens
+            } as any);
+            
+            let blueprintText = '';
+            for await (const chunk of blueprintResult.textStream) {
+              blueprintText += chunk;
+            }
+            
+            // Clean and parse the blueprint JSON
+            blueprintText = blueprintText.trim();
+            // Remove markdown fences if AI added them despite instructions
+            if (blueprintText.startsWith('```')) {
+              blueprintText = blueprintText.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '');
+            }
+            
+            blueprint = JSON.parse(blueprintText);
+            console.log('[generate-ai-code-stream] Blueprint generated:', JSON.stringify(blueprint, null, 2));
+            
+            await sendProgress({ 
+              type: 'status', 
+              message: `Planned ${blueprint.files.length} ${stage} files for ${blueprint.appName}` 
+            });
+            await sendProgress({
+              type: 'thinking',
+              text: `\nArchitectural Plan — ${blueprint.appName || 'Application'}:\n` +
+                (blueprint.files?.map((f: any) => `• ${f.path}: ${f.purpose || f.renders || 'Component'}`).join('\n') || '') +
+                `\n\nSynthesizing full production code...\n`
+            });
+            
+          } catch (blueprintError) {
+            console.warn('[generate-ai-code-stream] Blueprint generation failed, proceeding without:', blueprintError);
+            await sendProgress({ type: 'status', message: 'Planning complete, generating code...' });
+          }
+        } else {
+          await sendProgress({ type: 'status', message: 'Analyzing edit request...' });
+          await sendProgress({
+            type: 'thinking',
+            text: `Analyzing modification request: "${prompt}"...\nTargeting required files for safe in-place updates.\n`
+          });
+        }
+        
+        // ============ PHASE B: CODE GENERATION (Blueprint-Guided) ============
+        console.log('\n[generate-ai-code-stream] Phase B: Starting code generation...\n');
+        
+        // Build blueprint context for the code generation prompt
+        let blueprintContext = '';
+        if (blueprint) {
+          blueprintContext = `\n\nARCHITECTURE BLUEPRINT — THIS IS YOUR CONTRACT:\n${JSON.stringify(blueprint, null, 2)}\n\nYOU MUST:\n1. Generate files in EXACTLY this order: ${blueprint.files.map((f: any) => f.path).join(' → ')}\n2. Each component receives these props: check the "props" field\n3. Each component renders: check the "renders" field\n4. Color palette: bg=${blueprint.colorPalette?.bg || '#0f172a'}, primary=${blueprint.colorPalette?.primary || '#6366f1'}, text=${blueprint.colorPalette?.text || '#f8fafc'}\n5. Every file MUST be complete. If running low on tokens, STOP after the last complete </file> tag.\n6. NEVER import a file not listed in this blueprint.\n7. State management: ${blueprint.dataFlow || 'App.jsx manages all state, passes to children via props'}\n`;
+        }
 
         // Make streaming API call with appropriate provider
         const streamOptions: any = {
@@ -1166,72 +1063,34 @@ CRITICAL: When files are provided in the context:
           messages: [
             { 
               role: 'system', 
-              content: systemPrompt + `
-
-🚨 CRITICAL CODE GENERATION RULES - VIOLATION = FAILURE 🚨:
-1. NEVER truncate ANY code - ALWAYS write COMPLETE files
-2. NEVER use "..." anywhere in your code - this causes syntax errors
-3. NEVER cut off strings mid-sentence - COMPLETE every string
-4. NEVER leave incomplete class names or attributes
-5. ALWAYS close ALL tags, quotes, brackets, and parentheses
-6. If you run out of space, prioritize completing the current file
-
-CRITICAL STRING RULES TO PREVENT SYNTAX ERRORS:
-- NEVER write: className="px-8 py-4 bg-black text-white font-bold neobrut-border neobr...
-- ALWAYS write: className="px-8 py-4 bg-black text-white font-bold neobrut-border neobrut-shadow"
-- COMPLETE every className attribute
-- COMPLETE every string literal
-- NO ellipsis (...) ANYWHERE in code
-
-PACKAGE RULES:
-- For INITIAL generation: Use ONLY React, no external packages
-- For EDITS: You may use packages, specify them with <package> tags
-- NEVER install packages like @mendable/firecrawl-js unless explicitly requested
-
-Examples of SYNTAX ERRORS (NEVER DO THIS):
-❌ className="px-4 py-2 bg-blue-600 hover:bg-blue-7...
-❌ <button className="btn btn-primary btn-...
-❌ const title = "Welcome to our...
-❌ import { useState, useEffect, ... } from 'react'
-
-Examples of CORRECT CODE (ALWAYS DO THIS):
-✅ className="px-4 py-2 bg-blue-600 hover:bg-blue-700"
-✅ <button className="btn btn-primary btn-large">
-✅ const title = "Welcome to our application"
-✅ import { useState, useEffect, useCallback } from 'react'
-
-REMEMBER: It's better to generate fewer COMPLETE files than many INCOMPLETE files.`
+              content: systemPrompt
             },
             { 
               role: 'user', 
-              content: fullPrompt + `
-
-CRITICAL: You MUST complete EVERY file you start. If you write:
-<file path="src/components/Hero.jsx">
-
-You MUST include the closing </file> tag and ALL the code in between.
-
-NEVER write partial code like:
-<h1>Build and deploy on the AI Cloud.</h1>
-<p>Some text...</p>  ❌ WRONG
-
-ALWAYS write complete code:
-<h1>Build and deploy on the AI Cloud.</h1>
-<p>Some text here with full content</p>  ✅ CORRECT
-
-If you're running out of space, generate FEWER files but make them COMPLETE.
-It's better to have 3 complete files than 10 incomplete files.`
+              content: fullPrompt + blueprintContext + `\n\nCRITICAL: Complete EVERY file you start. Never truncate code. If running out of space, finish the current file and stop — remaining files will be generated in a continuation pass.`
             }
           ],
-          maxTokens: 8192, // Reduce to ensure completion
-          stopSequences: [] // Don't stop early
-          // Note: Neither Groq nor Anthropic models support tool/function calling in this context
-          // We use XML tags for package detection instead
+          maxTokens: appConfig.ai.maxTokens,
+          stopSequences: []
         };
         
         // Add temperature for non-reasoning models
         if (!model.startsWith('openai/gpt-5')) {
-          streamOptions.temperature = 0.7;
+          streamOptions.temperature = appConfig.ai.codeGenerationTemperature;
+        }
+        
+        // Enable extended thinking for Claude models
+        if (isAnthropic) {
+          // Remove temperature (not supported with thinking)
+          delete streamOptions.temperature;
+          streamOptions.providerOptions = {
+            anthropic: {
+              thinking: { type: 'enabled', budgetTokens: 10000 }
+            }
+          };
+          // Increase max tokens to accommodate thinking + code output
+          streamOptions.maxTokens = appConfig.ai.maxTokens + 10000;
+          console.log('[generate-ai-code-stream] Claude extended thinking enabled (10k budget)');
         }
         
         // Add reasoning effort for GPT-5 models
@@ -1243,7 +1102,16 @@ It's better to have 3 complete files than 10 incomplete files.`
           };
         }
         
-        const result = await streamText(streamOptions);
+        let result: any;
+        try {
+          result = await streamText(streamOptions);
+        } catch (streamErr) {
+          console.warn('[generate-ai-code-stream] Primary model failed, trying Groq gpt-oss-120b fallback:', streamErr);
+          streamOptions.model = resolveModel('openai/gpt-oss-120b');
+          delete streamOptions.experimental_providerMetadata;
+          delete streamOptions.providerOptions;
+          result = await streamText(streamOptions);
+        }
         
         // Stream the response and parse in real-time
         let generatedCode = '';
@@ -1467,6 +1335,162 @@ It's better to have 3 complete files than 10 incomplete files.`
           }
         }
         
+        // --- BLUEPRINT-AWARE CONTINUATION + IMPORT VALIDATION ---
+        let continuationPasses = 0;
+        const MAX_CONTINUATIONS = 4; // Up to 4 extra passes (5 total = ~80k tokens for massive apps)
+
+        // Extract already-generated file paths from complete <file>...</file> tags
+        const getGeneratedFiles = (code: string) => {
+          const matches = code.match(/<file path="[^"]+">[\s\S]*?<\/file>/g) || [];
+          return matches.map(m => m.match(/path="([^"]+)"/)?.[1] || '').filter(Boolean);
+        };
+
+        // Extract all relative imports from generated code to find missing files
+        const getMissingImports = (code: string, existingFiles: string[]) => {
+          const missing: string[] = [];
+          const importRegex = /import\s+.*?from\s+['"](\.\/.+?)['"]|import\s+['"](\.\/.+?)['"]/g;
+          let m;
+          while ((m = importRegex.exec(code)) !== null) {
+            let importPath = m[1] || m[2];
+            if (!importPath) continue;
+            // Normalize: ./contexts/AuthContext -> src/contexts/AuthContext.jsx (or .js)
+            let normalized = importPath.replace(/^\.\//,  'src/');
+            // Add extension if missing
+            if (!normalized.match(/\.(jsx?|tsx?|css|json)$/)) {
+              normalized += '.jsx';
+            }
+            // Check if this file exists in generated code
+            if (!existingFiles.some(f => {
+              const base = f.replace(/\.(jsx?|tsx?|js)$/, '');
+              const normBase = normalized.replace(/\.(jsx?|tsx?|js)$/, '');
+              return base === normBase || f === normalized;
+            })) {
+              if (!missing.includes(normalized)) {
+                missing.push(normalized);
+              }
+            }
+          }
+          return missing;
+        };
+        
+        // Determine if generation is truly complete
+        const isGenerationComplete = (code: string): { complete: boolean; missingBlueprint: string[]; missingImports: string[] } => {
+          const generatedFiles = getGeneratedFiles(code);
+          let missingBlueprint: string[] = [];
+          let missingImports: string[] = [];
+          
+          // Check against blueprint
+          if (blueprint && blueprint.files) {
+            const blueprintPaths = blueprint.files.map((f: any) => f.path);
+            missingBlueprint = blueprintPaths.filter((p: string) => !generatedFiles.includes(p));
+          }
+          
+          // Check for unresolved imports
+          missingImports = getMissingImports(code, generatedFiles);
+          
+          const complete = missingBlueprint.length === 0 && missingImports.length === 0;
+          return { complete, missingBlueprint, missingImports };
+        };
+
+        let completionStatus = isGenerationComplete(generatedCode);
+        
+        while (!completionStatus.complete && continuationPasses < MAX_CONTINUATIONS) {
+          continuationPasses++;
+          const generatedFiles = getGeneratedFiles(generatedCode);
+          const allMissing = [...new Set([...completionStatus.missingBlueprint, ...completionStatus.missingImports])];
+          
+          console.log(`[generate-ai-code-stream] Pass ${continuationPasses + 1}: Generated ${generatedFiles.length} files, missing ${allMissing.length}: [${allMissing.join(', ')}]`);
+          
+          // Build continuation context with missing file details
+          let continuationContext = '';
+          
+          if (blueprint && blueprint.files) {
+            const generatedManifest = blueprint.files
+              .filter((f: any) => generatedFiles.includes(f.path))
+              .map((f: any) => `- ${f.path}: ${f.purpose}${f.exports ? ` (exports: ${f.exports.join(', ')})` : ''}`)
+              .join('\n');
+            
+            // Combine blueprint remaining + import-detected missing files
+            const remainingFromBlueprint = blueprint.files
+              .filter((f: any) => allMissing.includes(f.path))
+              .map((f: any) => `- ${f.path}: ${f.purpose} (~${f.estimatedLines || 60} lines)${f.imports ? ` (imports: ${f.imports.join(', ')})` : ''}`);
+            
+            // Add import-detected missing files not in blueprint  
+            const extraMissing = allMissing
+              .filter(p => !blueprint.files.some((f: any) => f.path === p))
+              .map(p => `- ${p}: (imported by existing files, must be created)`);
+            
+            const allRemainingManifest = [...remainingFromBlueprint, ...extraMissing].join('\n');
+            
+            continuationContext = `You MUST generate the following missing files for "${blueprint.appName}".
+These files are imported by already-generated code and the app WILL NOT WORK without them.
+
+ALREADY COMPLETED (do NOT regenerate):
+${generatedManifest}
+
+MISSING FILES — GENERATE ALL OF THESE NOW:
+${allRemainingManifest}
+
+Theme: ${blueprint.theme || 'modern dark'}
+Data Flow: ${blueprint.dataFlow || 'standard React props'}
+Packages available: ${(blueprint.packages || []).join(', ') || 'none'}
+
+Rules:
+1. Output EVERY missing file using <file path="...">complete code</file> tags
+2. Match the architecture and imports of already-generated files
+3. Each file MUST be complete and runnable
+4. When done, end with <explanation>summary</explanation>`;
+          } else {
+            continuationContext = `The following files are imported but do not exist yet. Generate them NOW:
+
+${allMissing.map(f => `- ${f}`).join('\n')}
+
+Already generated: ${generatedFiles.join(', ')}
+
+Output each file using <file path="...">complete code</file> tags.
+When done, end with <explanation>summary</explanation>`;
+          }
+          
+          await sendProgress({
+            type: 'info',
+            message: `Generating ${allMissing.length} missing files (Pass ${continuationPasses + 1})...`
+          });
+          
+          try {
+            const continuationResult = await streamText({
+              model: modelProvider(actualModel),
+              messages: [
+                { role: 'system', content: `You are generating missing React component files. These files are REQUIRED — the app crashes without them. Output ONLY <file> tags with complete, working code. Start immediately with the first <file> tag.` },
+                { role: 'user', content: continuationContext }
+              ],
+              temperature: isOpenAI ? undefined : appConfig.ai.codeGenerationTemperature,
+              maxTokens: appConfig.ai.maxTokens
+            } as any);
+
+            let continuationCode = '';
+            for await (const chunk of continuationResult.textStream) {
+              continuationCode += chunk;
+              await sendProgress({ type: 'stream', text: chunk, raw: true });
+            }
+            
+            generatedCode += '\n' + continuationCode;
+            
+            // Re-check completion (blueprint + imports)
+            completionStatus = isGenerationComplete(generatedCode);
+            
+          } catch (contError) {
+            console.error(`[generate-ai-code-stream] Continuation pass ${continuationPasses + 1} failed:`, contError);
+            break;
+          }
+        }
+        
+        if (!completionStatus.complete) {
+          console.warn(`[generate-ai-code-stream] Generation incomplete after ${continuationPasses + 1} passes. Missing: [${[...completionStatus.missingBlueprint, ...completionStatus.missingImports].join(', ')}]`);
+        } else {
+          console.log(`[generate-ai-code-stream] Generation complete after ${continuationPasses + 1} pass(es)!`);
+        }
+        // --- END BLUEPRINT-AWARE CONTINUATION ---
+        
         // Extract explanation
         const explanationMatch = generatedCode.match(/<explanation>([\s\S]*?)<\/explanation>/);
         const explanation = explanationMatch ? explanationMatch[1].trim() : 'Code generated successfully!';
@@ -1554,7 +1578,11 @@ It's better to have 3 complete files than 10 incomplete files.`
             const closeBraceCount = (content.match(/}/g) || []).length;
             const hasUnmatchedBraces = Math.abs(openBraceCount - closeBraceCount) > 1;
             
-            const isTruncated = (hasEllipsis && endsAbruptly) || 
+            // If the match doesn't include the closing tag, it was cut off by the end of the string
+            const missingFileClosingTag = !match[0].includes('</file>');
+            
+            const isTruncated = missingFileClosingTag || 
+                               (hasEllipsis && endsAbruptly) || 
                                hasUnclosedTags || 
                                (tooShort && !content.includes('export')) ||
                                hasUnmatchedBraces;
@@ -1584,18 +1612,8 @@ Original request: ${prompt}
 Provide the complete file content without any truncation. Include all necessary imports, complete all functions, and close all tags properly.`;
                 
                 // Make a focused API call to complete this specific file
-                // Create a new client for the completion based on the provider
-                let completionClient;
-                if (model.includes('gpt') || model.includes('openai')) {
-                  completionClient = openai;
-                } else if (model.includes('claude')) {
-                  completionClient = anthropic;
-                } else {
-                  completionClient = groq;
-                }
-                
                 const completionResult = await streamText({
-                  model: completionClient(modelMapping[model] || model),
+                  model: modelProvider(actualModel),
                   messages: [
                     { 
                       role: 'system', 
@@ -1603,9 +1621,9 @@ Provide the complete file content without any truncation. Include all necessary 
                     },
                     { role: 'user', content: completionPrompt }
                   ],
-                  temperature: isGPT5 ? undefined : appConfig.ai.defaultTemperature,
+                  temperature: isOpenAI ? undefined : appConfig.ai.defaultTemperature,
                   maxTokens: appConfig.ai.truncationRecoveryMaxTokens
-                });
+                } as any);
                 
                 // Get the full text from the stream
                 let completedContent = '';
@@ -1653,7 +1671,146 @@ Provide the complete file content without any truncation. Include all necessary 
           }
         }
         
-        // Send completion with packages info
+        // ============ DEAD ROUTE CLEANUP ============
+        // If App.jsx imports components that were never generated, fix it
+        if (!isEdit && stage === 'frontend') {
+          const generatedFilePaths = getGeneratedFiles(generatedCode);
+          const appFileMatch = generatedCode.match(/<file path="src\/App\.jsx">([\s\S]*?)<\/file>/);
+          if (appFileMatch) {
+            const appContent = appFileMatch[1];
+            const importRegex = /import\s+(?:\w+|\{[^}]+\})\s+from\s+['"](\.\/.+?)['"]/g;
+            let deadImports: string[] = [];
+            let importMatch;
+            while ((importMatch = importRegex.exec(appContent)) !== null) {
+              const importPath = importMatch[1];
+              let normalized = importPath.replace(/^\.\//,  'src/');
+              if (!normalized.match(/\.(jsx?|tsx?|css|json)$/)) normalized += '.jsx';
+              if (!generatedFilePaths.some(f => f.replace(/\.(jsx?|tsx?)$/, '') === normalized.replace(/\.(jsx?|tsx?)$/, ''))) {
+                deadImports.push(importMatch[0]);
+              }
+            }
+            
+            if (deadImports.length > 0) {
+              console.log(`[generate-ai-code-stream] Found ${deadImports.length} dead imports in App.jsx:`, deadImports);
+              await sendProgress({ type: 'info', message: `Cleaning ${deadImports.length} unresolved imports from App.jsx...` });
+              
+              // Auto-regenerate App.jsx with only valid imports
+              try {
+                const cleanupResult = await streamText({
+                  model: modelProvider(actualModel),
+                  messages: [
+                    { role: 'system', content: 'You are fixing a React App.jsx that imports components which do not exist. Remove the dead imports AND their usage in JSX. Output ONLY the fixed file content — no XML tags, no explanation.' },
+                    { role: 'user', content: `Fix this App.jsx. Remove these dead imports and their JSX usage:\n${deadImports.join('\n')}\n\nCurrent App.jsx:\n${appContent.substring(0, 4000)}\n\nAvailable components: ${generatedFilePaths.filter(f => f !== 'src/App.jsx' && f !== 'src/index.css').join(', ')}\n\nOutput ONLY the fixed code.` }
+                  ],
+                  maxTokens: 4096,
+                  temperature: 0.2
+                } as any);
+                
+                let fixedApp = '';
+                for await (const chunk of cleanupResult.textStream) { fixedApp += chunk; }
+                fixedApp = fixedApp.trim();
+                if (fixedApp.startsWith('```')) fixedApp = fixedApp.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '');
+                
+                // Replace the App.jsx in generated code
+                generatedCode = generatedCode.replace(/<file path="src\/App\.jsx">[\s\S]*?<\/file>/, `<file path="src/App.jsx">\n${fixedApp}\n</file>`);
+                console.log('[generate-ai-code-stream] ✅ Dead routes cleaned from App.jsx');
+              } catch (cleanupErr) {
+                console.warn('[generate-ai-code-stream] Dead route cleanup failed:', cleanupErr);
+              }
+            }
+          }
+        }
+        // ============ END DEAD ROUTE CLEANUP ============
+        
+        // ============ IMPORT/EXPORT VALIDATION ============
+        // Fix named vs default export mismatches before code goes to sandbox
+        {
+          const allFiles = generatedCode.match(/<file path="([^"]+)">([\s\S]*?)<\/file>/g) || [];
+          
+          // Build a map: filePath -> exportStyle ('default' | 'named')
+          const exportMap: Record<string, { style: 'default' | 'named'; name: string }> = {};
+          for (const fileBlock of allFiles) {
+            const pathMatch = fileBlock.match(/path="([^"]+)"/);
+            const contentMatch = fileBlock.match(/<file[^>]*>([\s\S]*?)<\/file>/);
+            if (!pathMatch || !contentMatch) continue;
+            const filePath = pathMatch[1];
+            const content = contentMatch[1];
+            
+            // Check export style
+            const defaultExportMatch = content.match(/export\s+default\s+(?:function\s+)?(\w+)/);
+            const namedExportMatch = content.match(/export\s+(?:const|function|class)\s+(\w+)/);
+            
+            if (defaultExportMatch) {
+              exportMap[filePath] = { style: 'default', name: defaultExportMatch[1] };
+            } else if (namedExportMatch) {
+              exportMap[filePath] = { style: 'named', name: namedExportMatch[1] };
+            }
+          }
+          
+          // Now check all imports and fix mismatches
+          let fixCount = 0;
+          for (const fileBlock of allFiles) {
+            const pathMatch = fileBlock.match(/path="([^"]+)"/);
+            const contentMatch = fileBlock.match(/<file[^>]*>([\s\S]*?)<\/file>/);
+            if (!pathMatch || !contentMatch) continue;
+            const filePath = pathMatch[1];
+            let content = contentMatch[1];
+            let modified = false;
+            
+            // Find all relative imports in this file
+            const importRegex = /import\s+(\{\s*(\w+)\s*\})\s+from\s+['"](\.\/.+?)['"]/g;
+            let m;
+            while ((m = importRegex.exec(content)) !== null) {
+              const namedImport = m[1]; // { Name }
+              const componentName = m[2]; // Name
+              const importPath = m[3]; // ./path
+              
+              // Resolve to file path
+              let resolved = importPath.replace(/^\.\//,  'src/');
+              if (!resolved.match(/\.(jsx?|tsx?|css)$/)) resolved += '.jsx';
+              
+              const exportInfo = exportMap[resolved];
+              if (exportInfo && exportInfo.style === 'default') {
+                // Mismatch! Using { Name } but file has export default
+                content = content.replace(m[0], `import ${componentName} from '${importPath}'`);
+                modified = true;
+                fixCount++;
+                console.log(`[generate-ai-code-stream] Fixed import: { ${componentName} } → ${componentName} in ${filePath}`);
+              }
+            }
+            
+            // Also fix: import Name but file uses named export
+            const defaultImportRegex = /import\s+(\w+)\s+from\s+['"](\.\/.+?)['"]/g;
+            while ((m = defaultImportRegex.exec(content)) !== null) {
+              const componentName = m[1];
+              const importPath = m[2];
+              if (componentName === 'React') continue; // Skip React
+              
+              let resolved = importPath.replace(/^\.\//,  'src/');
+              if (!resolved.match(/\.(jsx?|tsx?|css)$/)) resolved += '.jsx';
+              
+              const exportInfo = exportMap[resolved];
+              if (exportInfo && exportInfo.style === 'named') {
+                content = content.replace(m[0], `import { ${componentName} } from '${importPath}'`);
+                modified = true;
+                fixCount++;
+                console.log(`[generate-ai-code-stream] Fixed import: ${componentName} → { ${componentName} } in ${filePath}`);
+              }
+            }
+            
+            if (modified) {
+              generatedCode = generatedCode.replace(fileBlock, `<file path="${filePath}">${content}</file>`);
+            }
+          }
+          
+          if (fixCount > 0) {
+            console.log(`[generate-ai-code-stream] ✅ Fixed ${fixCount} import/export mismatches`);
+            await sendProgress({ type: 'info', message: `✅ Fixed ${fixCount} import/export mismatches` });
+          }
+        }
+        // ============ END IMPORT/EXPORT VALIDATION ============
+        
+        // Send completion with packages info and stage
         await sendProgress({ 
           type: 'complete', 
           generatedCode,
@@ -1661,6 +1818,8 @@ Provide the complete file content without any truncation. Include all necessary 
           files: files.length,
           components: componentCount,
           model,
+          stage,
+          hasBackend: blueprint?.needsBackend || false,
           packagesToInstall: packagesToInstall.length > 0 ? packagesToInstall : undefined,
           warnings: truncationWarnings.length > 0 ? truncationWarnings : undefined
         });
@@ -1711,7 +1870,11 @@ Provide the complete file content without any truncation. Include all necessary 
           });
         }
       } finally {
-        await writer.close();
+        try {
+          await writer.close();
+        } catch {
+          // Stream already closed or aborted by client
+        }
       }
     })();
     

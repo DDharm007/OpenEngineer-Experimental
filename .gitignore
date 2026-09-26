@@ -54,5 +54,12 @@ e2b-template-*
 # Temporary files
 *.tmp
 *.temp
+*.log
+*-log.txt
+*output.txt
+diff.txt
+lint.txt
+test-model-debug.txt
+.test
 repomix-output.txt
 bun.lockb

@@ -73,7 +73,11 @@ package_json = {
     },
     "dependencies": {
         "react": "^18.2.0",
-        "react-dom": "^18.2.0"
+        "react-dom": "^18.2.0",
+        "react-router-dom": "^6.20.0",
+        "firebase": "^10.7.0",
+        "express": "^4.18.2",
+        "cors": "^2.8.5"
     },
     "devDependencies": {
         "@vitejs/plugin-react": "^4.0.0",
@@ -226,9 +230,9 @@ print('\\nAll files created successfully!')
 `;
 
     // Execute the setup script
-    await sandbox.runCode(setupScript);
+    await sandbox.runCode(setupScript, { timeoutMs: 120000 });
     
-    // Install dependencies
+    // Install dependencies (firebase is ~70MB, needs more time)
     console.log('[create-ai-sandbox] Installing dependencies...');
     await sandbox.runCode(`
 import subprocess
@@ -239,7 +243,8 @@ result = subprocess.run(
     ['npm', 'install'],
     cwd='/home/user/app',
     capture_output=True,
-    text=True
+    text=True,
+    timeout=120
 )
 
 if result.returncode == 0:
@@ -247,7 +252,7 @@ if result.returncode == 0:
 else:
     print(f'⚠ Warning: npm install had issues: {result.stderr}')
     # Continue anyway as it might still work
-    `);
+    `, { timeoutMs: 180000 });
     
     // Start Vite dev server
     console.log('[create-ai-sandbox] Starting Vite dev server...');
@@ -275,7 +280,7 @@ process = subprocess.Popen(
 
 print(f'✓ Vite dev server started with PID: {process.pid}')
 print('Waiting for server to be ready...')
-    `);
+    `, { timeoutMs: 60000 });
     
     // Wait for Vite to be fully ready
     await new Promise(resolve => setTimeout(resolve, appConfig.e2b.viteStartupDelay));

@@ -57,7 +57,9 @@ const config: Config = {
         sm: "calc(var(--radius) - 4px)",
       },
       fontFamily: {
-        sans: ["var(--font-inter)", "ui-sans-serif", "system-ui", "sans-serif"],
+        sans: ["Poppins", "ui-sans-serif", "system-ui", "sans-serif"],
+        poppins: ["Poppins", "sans-serif"],
+        pressStart: ["'Press Start 2P'", "cursive"],
         mono: ["ui-monospace", "SFMono-Regular", "monospace"],
       },
     },

@@ -1,0 +1,22 @@
+{
+  "name": "Craftorā C1 Builder",
+  "short_name": "Craftorā C1",
+  "description": "Re-imagine any website in seconds with AI-powered website builder",
+  "icons": [
+    {
+      "src": "/android-chrome-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/android-chrome-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "theme_color": "#8b00ff",
+  "background_color": "#1a1a1a",
+  "display": "standalone",
+  "start_url": "/",
+  "orientation": "portrait"
+}
